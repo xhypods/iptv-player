@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Channel Player</title>
+<style>
+:root{--bg:#fff;--fg:#14161a;--mut:#69707d;--card:#f2f3f5;--line:#dcdfe4;--acc:#1f5fd6;--on:#1f5fd622;--err:#c4281c}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1013;--fg:#e9eaec;--mut:#98a0ac;--card:#181b21;--line:#2a2f38;--acc:#6aa3ff;--on:#6aa3ff22;--err:#ff7a70}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:12px;display:grid;gap:16px}
+@media(min-width:900px){.wrap{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);align-items:start}.left{position:sticky;top:12px}}
+video{width:100%;aspect-ratio:16/9;background:#000;border-radius:6px;display:block}
+#now{margin:.5rem 0 0;font-weight:600;min-height:1.4em}
+#err{margin:.25rem 0;color:var(--err);min-height:1.2em;font-size:14px}
+input,select,textarea,button{font:inherit;color:inherit;width:100%;padding:.55rem .65rem;margin:.2rem 0;background:var(--card);border:1px solid var(--line);border-radius:6px}
+button{cursor:pointer;background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.alt{background:var(--card);color:var(--fg);border-color:var(--line);font-weight:500}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,.ch:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+details{border:1px solid var(--line);border-radius:6px;margin:.4rem 0;padding:0 .7rem}
+summary{cursor:pointer;padding:.6rem 0;font-weight:600}
+details[open]{padding-bottom:.6rem}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:.4rem}
+.hint{color:var(--mut);font-size:13px;margin:.2rem 0 .4rem}
+#list{border:1px solid var(--line);border-radius:6px;max-height:60vh;overflow:auto}
+.ch{display:flex;align-items:center;gap:.6rem;padding:.5rem .6rem;cursor:pointer;border-bottom:1px solid var(--line)}
+.ch:last-child{border-bottom:0}
+.ch.on{background:var(--on)}
+.ch img{width:34px;height:34px;object-fit:contain;flex:none}
+.ch .t{flex:1;min-width:0}
+.ch b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.ch small{color:var(--mut)}
+.ch .x{width:auto;margin:0;padding:.2rem .55rem;background:none;border:0;color:var(--mut);font-size:18px;line-height:1}
+.bar{display:flex;gap:.4rem}.bar>*{flex:1}
+.empty{padding:1.2rem;color:var(--mut);text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="left">
+    <video id="v" controls playsinline></video>
+    <p id="now"></p>
+    <p id="err" role="alert"></p>
+
+    <details open>
+      <summary>Add a channel</summary>
+      <input id="aName" placeholder="Channel name (optional)">
+      <input id="aUrl" placeholder="Stream URL (.mpd, .m3u8 or .ts)">
+      <input id="aKey" placeholder="Key: KID:KEY, or license server URL (optional)">
+      <p class="hint">For several keys, separate pairs with commas: kid1:key1,kid2:key2</p>
+      <div class="bar"><button id="aSave">Save channel</button><button id="aPlay" class="alt">Play now</button></div>
+    </details>
+
+    <details>
+      <summary>Load a playlist (M3U / M3U8)</summary>
+      <input id="pUrl" placeholder="Playlist URL">
+      <button id="pLoad">Load from URL</button>
+      <input id="pFile" type="file" accept=".m3u,.m3u8,.txt,text/plain,audio/x-mpegurl,application/vnd.apple.mpegurl">
+      <textarea id="pText" rows="4" placeholder="Or paste playlist text"></textarea>
+      <button id="pPaste" class="alt">Load pasted text</button>
+      <p class="hint">Choosing a file or pasting text skips CORS limits on the playlist itself.</p>
+    </details>
+
+    <details>
+      <summary>Xtream Codes login</summary>
+      <input id="xHost" placeholder="Server (http://host:port)" autocapitalize="off">
+      <div class="row"><input id="xUser" placeholder="Username" autocapitalize="off"><input id="xPass" type="password" placeholder="Password"></div>
+      <select id="xFmt"><option value="m3u8">Stream as HLS (.m3u8)</option><option value="ts">Stream as MPEG-TS (.ts)</option></select>
+      <button id="xLoad">Load live channels</button>
+      <p class="hint">Server and username are remembered in this browser. The password is not.</p>
+    </details>
+  </div>
+
+  <div class="right">
+    <input id="q" type="search" placeholder="Search channels" aria-label="Search channels">
+    <select id="grp" aria-label="Group"><option value="">All groups</option></select>
+    <p class="hint" id="count"></p>
+    <div id="list"></div>
+    <div class="bar" style="margin-top:.4rem">
+      <button id="exp" class="alt">Export M3U</button>
+      <button id="clr" class="alt">Clear all</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/shaka-player@4.7.11/dist/shaka-player.compiled.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v'), errEl = $('err');
+const say = m => errEl.textContent = m || '';
+
+let channels = [], cur = -1, sh = null, mp = null, token = 0;
+try { channels = JSON.parse(localStorage.getItem('channels') || '[]'); } catch {}
+const save = () => { try { localStorage.setItem('channels', JSON.stringify(channels)); } catch {} };
+
+shaka.polyfill.installAll();
+if (shaka.Player.isBrowserSupported()) {
+  sh = new shaka.Player();
+  sh.attach(v);
+}
+
+/* ---------- stream type + keys ---------- */
+function kind(url) {
+  const u = url.toLowerCase();
+  const path = u.split(/[?#]/)[0];
+  if (/\.mpd$/.test(path) || u.includes('.mpd')) return 'dash';
+  if (/\.m3u8$/.test(path) || u.includes('.m3u8')) return 'hls';
+  if (/\.ts$/.test(path)) return 'ts';
+  return 'auto';
+}
+
+function drmFrom(key) {
+  const drm = {};
+  key = (key || '').trim();
+  if (!key) return drm;
+  if (/^https?:\/\//i.test(key)) {
+    drm.servers = { 'com.widevine.alpha': key };
+    return drm;
+  }
+  const keys = {};
+  if (key.startsWith('{')) {
+    try { Object.assign(keys, JSON.parse(key)); } catch {}
+  } else {
+    key.split(',').forEach(p => {
+      const [kid, k] = p.trim().split(':');
+      if (kid && k) keys[kid.trim()] = k.trim();
+    });
+  }
+  if (Object.keys(keys).length) drm.clearKeys = keys;
+  return drm;
+}
+
+/* ---------- playback ---------- */
+async function stop() {
+  if (mp) { try { mp.destroy(); } catch {} mp = null; }
+  if (sh) { try { await sh.unload(); } catch {} }
+  v.removeAttribute('src'); v.load();
+}
+
+function playTS(url, id) {
+  if (!window.mpegts || !mpegts.getFeatureList().mseLivePlayback)
+    throw new Error('This browser cannot play raw .ts streams.');
+  mp = mpegts.createPlayer({ type: 'mpegts', isLive: true, url },
+    { enableWorker: true, liveBufferLatencyChasing: true });
+  mp.attachMediaElement(v);
+  mp.on(mpegts.Events.ERROR, (type, detail) => {
+    if (id === token) say('Stream error: ' + (detail || type) + '. The server may be blocking cross-origin requests, or the stream is offline.');
+  });
+  mp.load();
+  return mp.play();
+}
+
+async function playShaka(url, key) {
+  if (!sh) throw new Error('This browser cannot play DASH/HLS.');
+  sh.resetConfiguration();
+  sh.configure({ drm: drmFrom(key) });
+  await sh.load(url);
+  v.play().catch(() => {});
+}
+
+async function playStream(url, key) {
+  const id = ++token;
+  say('');
+  await stop();
+  const k = kind(url);
+  try {
+    if (k === 'ts') await playTS(url, id);
+    else if (k === 'auto') {
+      try { await playShaka(url, key); }
+      catch (e) { if (id !== token) return; await stop(); await playTS(url, id); }
+    } else await playShaka(url, key);
+  } catch (e) {
+    if (id !== token) return;
+    const c = e && e.code;
+    say(c === 1001 || c === 1002
+      ? 'Blocked (error ' + c + '): the stream server does not allow requests from this page (CORS), or the URL is offline.'
+      : c ? 'Playback error ' + c + (c === 6007 || c === 6006 ? ' (key or license problem)' : '')
+          : (e && e.message) || 'Could not play this stream.');
+  }
+}
+
+function play(i) {
+  if (i < 0 || i >= channels.length) return;
+  cur = i;
+  $('now').textContent = channels[i].name;
+  render();
+  playStream(channels[i].url, channels[i].key);
+}
+
+/* ---------- list ---------- */
+function render() {
+  const q = $('q').value.trim().toLowerCase(), g = $('grp').value;
+  const box = $('list'); box.textContent = '';
+  const groups = [...new Set(channels.map(c => c.group).filter(Boolean))].sort();
+  const sel = $('grp'), keep = sel.value;
+  if (sel.options.length - 1 !== groups.length) {
+    sel.textContent = '';
+    sel.add(new Option('All groups', ''));
+    groups.forEach(x => sel.add(new Option(x, x)));
+    sel.value = groups.includes(keep) ? keep : '';
+  }
+  let shown = 0, total = 0;
+  channels.forEach((ch, i) => {
+    if (g && ch.group !== g) return;
+    if (q && !(ch.name + ' ' + (ch.group || '')).toLowerCase().includes(q)) return;
+    total++;
+    if (shown >= 300) return;
+    shown++;
+    const d = document.createElement('div');
+    d.className = 'ch' + (i === cur ? ' on' : '');
+    d.tabIndex = 0;
+    if (ch.logo && /^https?:/i.test(ch.logo)) {
+      const im = document.createElement('img');
+      im.src = ch.logo; im.loading = 'lazy'; im.alt = '';
+      im.onerror = () => im.remove();
+      d.appendChild(im);
+    }
+    const t = document.createElement('div'); t.className = 't';
+    const b = document.createElement('b'); b.textContent = ch.name;
+    const s = document.createElement('small');
+    const k = kind(ch.url);
+    s.textContent = [ch.group, k === 'dash' ? 'DASH' : k === 'hls' ? 'HLS' : k === 'ts' ? 'TS' : '', ch.key ? 'key' : ''].filter(Boolean).join(' / ');
+    t.append(b, s); d.appendChild(t);
+    const x = document.createElement('button');
+    x.className = 'x'; x.textContent = '\u00d7'; x.title = 'Remove'; x.setAttribute('aria-label', 'Remove ' + ch.name);
+    x.onclick = e => { e.stopPropagation(); channels.splice(i, 1); if (cur === i) cur = -1; else if (cur > i) cur--; save(); render(); };
+    d.appendChild(x);
+    d.onclick = () => play(i);
+    d.onkeydown = e => { if (e.key === 'Enter') play(i); };
+    box.appendChild(d);
+  });
+  if (!channels.length) {
+    const e = document.createElement('div'); e.className = 'empty';
+    e.textContent = 'No channels yet. Add one, load a playlist, or log in to an Xtream server.';
+    box.appendChild(e);
+  }
+  $('count').textContent = channels.length
+    ? (total > shown ? `Showing ${shown} of ${total} matches. Search to narrow down.` : `${total} channel${total === 1 ? '' : 's'}`)
+    : '';
+}
+
+function addChannels(list) {
+  const have = new Set(channels.map(c => c.url + '|' + (c.key || '')));
+  let n = 0;
+  list.forEach(c => {
+    const id = c.url + '|' + (c.key || '');
+    if (!c.url || have.has(id)) return;
+    have.add(id); channels.push(c); n++;
+  });
+  save(); render();
+  return n;
+}
+
+/* ---------- M3U ---------- */
+function parseM3U(text) {
+  const out = []; let c = {};
+  for (let line of text.split(/\r?\n/)) {
+    line = line.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF')) {
+      c.name = line.slice(line.lastIndexOf(',') + 1).trim();
+      c.logo = (line.match(/tvg-logo="([^"]*)"/) || [])[1];
+      c.group = (line.match(/group-title="([^"]*)"/) || [])[1];
+      if (!c.name) c.name = (line.match(/tvg-name="([^"]*)"/) || [])[1];
+    } else if (/^#KODIPROP:inputstream\.adaptive\.license_key=/i.test(line)) {
+      c.key = line.slice(line.indexOf('license_key=') + 12).trim();
+    } else if (/^#EXTGRP:/i.test(line)) {
+      c.group = c.group || line.slice(8).trim();
+    } else if (!line.startsWith('#')) {
+      const url = line.split('|')[0].trim();
+      if (/^https?:\/\//i.test(url))
+        out.push({ name: c.name || url, url, key: c.key || '', logo: c.logo || '', group: c.group || '' });
+      c = {};
+    }
+  }
+  return out;
+}
+
+function importText(text, label) {
+  const list = parseM3U(text);
+  if (!list.length) return say('No channels found in ' + label + '. Check that it is an M3U playlist.');
+  const n = addChannels(list);
+  say('');
+  $('now').textContent = `Added ${n} channel${n === 1 ? '' : 's'} from ${label}` + (n < list.length ? ` (${list.length - n} already saved)` : '');
+}
+
+$('pLoad').onclick = async () => {
+  const u = $('pUrl').value.trim();
+  if (!u) return say('Enter a playlist URL.');
+  say('Loading playlist...');
+  try {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    importText(await r.text(), 'the playlist');
+  } catch (e) {
+    say('Could not fetch the playlist (' + e.message + '). The server may block cross-origin requests, or the page is HTTPS and the link is HTTP. Download the file and use "Choose file" instead.');
+  }
+};
+$('pFile').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  importText(await f.text(), f.name); e.target.value = '';
+};
+$('pPaste').onclick = () => importText($('pText').value, 'pasted text');
+
+/* ---------- Xtream ---------- */
+try {
+  $('xHost').value = localStorage.getItem('xHost') || '';
+  $('xUser').value = localStorage.getItem('xUser') || '';
+} catch {}
+
+$('xLoad').onclick = async () => {
+  let host = $('xHost').value.trim().replace(/\/+$/, '').replace(/\/(player_api|get)\.php.*$/, '');
+  const user = $('xUser').value.trim(), pass = $('xPass').value, ext = $('xFmt').value;
+  if (!host || !user || !pass) return say('Enter the server, username and password.');
+  if (!/^https?:\/\//i.test(host)) host = 'http://' + host;
+  try { localStorage.setItem('xHost', host); localStorage.setItem('xUser', user); } catch {}
+  const api = a => `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&action=${a}`;
+  say('Logging in...');
+  try {
+    const [cr, sr] = await Promise.all([fetch(api('get_live_categories')), fetch(api('get_live_streams'))]);
+    if (!sr.ok) throw new Error('HTTP ' + sr.status);
+    const cats = {};
+    try { (await cr.json()).forEach(c => cats[c.category_id] = c.category_name); } catch {}
+    const streams = await sr.json();
+    if (!Array.isArray(streams) || !streams.length) throw new Error('no live streams returned (check the login)');
+    const list = streams.map(s => ({
+      name: s.name || ('Stream ' + s.stream_id),
+      url: `${host}/live/${encodeURIComponent(user)}/${encodeURIComponent(pass)}/${s.stream_id}.${ext}`,
+      key: '', logo: s.stream_icon || '', group: cats[s.category_id] || ''
+    }));
+    const n = addChannels(list);
+    say(''); $('now').textContent = `Added ${n} live channel${n === 1 ? '' : 's'} from Xtream`;
+  } catch (e) {
+    const mixed = location.protocol === 'https:' && host.startsWith('http:');
+    say('Xtream login failed (' + e.message + ').' + (mixed
+      ? ' This page is HTTPS and your server is HTTP, so the browser blocks it. Open index.html from your computer instead, or use an HTTPS server address.'
+      : ' The server may not allow cross-origin requests, or the details are wrong.'));
+  }
+};
+
+/* ---------- add one channel ---------- */
+function readForm() {
+  const url = $('aUrl').value.trim();
+  if (!/^https?:\/\//i.test(url)) { say('Enter a stream URL starting with http:// or https://'); return null; }
+  return { name: $('aName').value.trim() || url.split('/').pop().split('?')[0] || url, url, key: $('aKey').value.trim(), logo: '', group: 'My channels' };
+}
+$('aSave').onclick = () => {
+  const c = readForm(); if (!c) return;
+  const n = addChannels([c]);
+  say(n ? '' : 'That stream and key are already saved.');
+  if (n) { $('aName').value = $('aUrl').value = $('aKey').value = ''; }
+};
+$('aPlay').onclick = () => {
+  const c = readForm(); if (!c) return;
+  cur = -1; $('now').textContent = c.name; render(); playStream(c.url, c.key);
+};
+
+/* ---------- misc ---------- */
+$('q').oninput = render;
+$('grp').onchange = render;
+$('exp').onclick = () => {
+  if (!channels.length) return say('Nothing to export yet.');
+  const t = '#EXTM3U\n' + channels.map(c =>
+    `#EXTINF:-1${c.logo ? ` tvg-logo="${c.logo}"` : ''}${c.group ? ` group-title="${c.group}"` : ''},${c.name}\n` +
+    (c.key ? `#KODIPROP:inputstream.adaptive.license_key=${c.key}\n` : '') + c.url).join('\n') + '\n';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([t], { type: 'audio/x-mpegurl' }));
+  a.download = 'channels.m3u'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+$('clr').onclick = () => {
+  if (channels.length && confirm('Remove all saved channels from this browser?')) {
+    channels = []; cur = -1; save(); render();
+  }
+};
+
+document.addEventListener('keydown', e => {
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+  if (e.key === ' ') { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+  else if (e.key === 'ArrowRight') v.currentTime += 10;
+  else if (e.key === 'ArrowLeft') v.currentTime -= 10;
+  else if (e.key === 'm') v.muted = !v.muted;
+  else if (e.key === 'f') v.requestFullscreen && v.requestFullscreen();
+  else if (e.key === 'ArrowUp' || e.key === 'PageUp') { e.preventDefault(); play(cur - 1); }
+  else if (e.key === 'ArrowDown' || e.key === 'PageDown') { e.preventDefault(); play(cur + 1); }
+});
+
+render();
+</script>
+</body>
+</html>
